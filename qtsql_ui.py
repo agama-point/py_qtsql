@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import html
-import secrets
-import sqlite3
-import string
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QRegularExpression, Qt
+from PyQt6.QtCore import QRegularExpression, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -31,103 +27,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from qtsql_worker import DB_PATH, KEY_NAME
+
 
 VER = "0.1 | 2026-06"
-DB_PATH = Path("data/main_data.db")
-ENV_PATH = Path(".env")
-KEY_NAME = "XEY_HEX"
-DEFAULT_KEY = "123abc"
-BASE64_ASCII = string.ascii_letters + string.digits + "+/"
-
-
-def key_bytes_from_hex(hex_key: str) -> bytes:
-    return bytes.fromhex(hex_key)
-
-
-def _xor_bytes(source: bytes, key_bytes: bytes) -> bytes:
-    return bytes(byte ^ key_bytes[index % len(key_bytes)] for index, byte in enumerate(source))
-
-
-def _pad_short_text(text_bytes: bytes, key_len: int) -> bytes:
-    if len(text_bytes) >= key_len:
-        return text_bytes
-    target_len = key_len
-    while len(text_bytes) + 2 > target_len:
-        target_len += key_len
-    random_len = target_len - len(text_bytes) - 2
-    random_tail = "".join(secrets.choice(BASE64_ASCII) for _ in range(random_len)).encode("ascii")
-    return text_bytes + b"/*" + random_tail
-
-
-def text_to_xor_hex(text: str, hex_key: str) -> str:
-    text_bytes = text.encode("utf-8")
-    if not hex_key:
-        return text_bytes.hex()
-    if not is_valid_hex_key(hex_key):
-        raise ValueError("Invalid hex key")
-    key_bytes = key_bytes_from_hex(hex_key)
-    return _xor_bytes(_pad_short_text(text_bytes, len(key_bytes)), key_bytes).hex()
-
-
-def text_from_xor_hex(value: str, hex_key: str) -> str:
-    if not value:
-        return ""
-    try:
-        xor_bytes = bytes.fromhex(value)
-    except ValueError:
-        return value
-    if not hex_key:
-        return xor_bytes.decode("utf-8", errors="replace")
-    if not is_valid_hex_key(hex_key):
-        return value
-    key_bytes = key_bytes_from_hex(hex_key)
-    decoded = _xor_bytes(xor_bytes, key_bytes)
-    decoded = decoded.split(b"/*", 1)[0]
-    return decoded.decode("utf-8", errors="replace")
-
-
-def _read_env_lines() -> list[str]:
-    if not ENV_PATH.exists():
-        return []
-    return ENV_PATH.read_text(encoding="utf-8").splitlines()
-
-
-def read_key_hex() -> str:
-    for line in _read_env_lines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        name, value = stripped.split("=", 1)
-        if name.strip() != KEY_NAME:
-            continue
-        return value.strip().strip("\"'")
-    return ""
-
-
-def save_key_hex(hex_value: str) -> None:
-    lines = _read_env_lines()
-    replacement = f"{KEY_NAME}={hex_value}"
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith(f"{KEY_NAME}="):
-            lines[index] = replacement
-            break
-    else:
-        lines.append(replacement)
-    ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-
-def is_valid_hex_key(hex_value: str) -> bool:
-    if not hex_value or len(hex_value) % 2:
-        return False
-    try:
-        bytes.fromhex(hex_value)
-    except ValueError:
-        return False
-    return True
 
 
 class MainWindow(QWidget):
+    action_requested = pyqtSignal(str, object)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("py_qtsql | SQLite XOR Demo")
@@ -135,12 +43,8 @@ class MainWindow(QWidget):
         self.setMinimumSize(980, 620)
         self._rows: list[dict[str, Any]] = []
         self._editing_uid: int | None = None
-        self._ensure_key()
-        self._ensure_database()
         self._build_ui()
         self._apply_theme()
-        self.load_key()
-        self.load_records()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -190,7 +94,7 @@ class MainWindow(QWidget):
         self.show_key_button.toggled.connect(self.toggle_key_visibility)
         row.addWidget(self.show_key_button)
         save_btn = QPushButton("Edit / Save")
-        save_btn.clicked.connect(self.save_key)
+        save_btn.clicked.connect(self.request_save_key)
         row.addWidget(save_btn)
         row.addStretch()
         layout.addLayout(row)
@@ -228,17 +132,17 @@ class MainWindow(QWidget):
 
         row = QHBoxLayout()
         new_btn = QPushButton("New record")
-        new_btn.clicked.connect(self.add_record)
+        new_btn.clicked.connect(self.request_add_record)
         row.addWidget(new_btn)
         self.save_edit_button = QPushButton("Save edit")
-        self.save_edit_button.clicked.connect(self.save_edit)
+        self.save_edit_button.clicked.connect(self.request_save_edit)
         self.save_edit_button.setEnabled(False)
         row.addWidget(self.save_edit_button)
         cancel_edit_btn = QPushButton("Cancel edit")
         cancel_edit_btn.clicked.connect(self.clear_edit_form)
         row.addWidget(cancel_edit_btn)
         reload_btn = QPushButton("Reload")
-        reload_btn.clicked.connect(self.load_records)
+        reload_btn.clicked.connect(self.request_load_records)
         row.addWidget(reload_btn)
         row.addStretch()
         layout.addLayout(row)
@@ -256,10 +160,10 @@ class MainWindow(QWidget):
         all_btn.clicked.connect(self.clear_filters)
         row.addWidget(all_btn)
         self.filter_key1_checkbox = QCheckBox("k1")
-        self.filter_key1_checkbox.toggled.connect(self.load_records)
+        self.filter_key1_checkbox.toggled.connect(self.request_load_records)
         row.addWidget(self.filter_key1_checkbox)
         self.filter_key2_checkbox = QCheckBox("k2")
-        self.filter_key2_checkbox.toggled.connect(self.load_records)
+        self.filter_key2_checkbox.toggled.connect(self.request_load_records)
         row.addWidget(self.filter_key2_checkbox)
         row.addStretch()
         layout.addLayout(row)
@@ -310,9 +214,10 @@ class MainWindow(QWidget):
         table_header.addStretch()
         self.decode_checkbox = QCheckBox("decode")
         self.decode_checkbox.setChecked(False)
-        self.decode_checkbox.toggled.connect(lambda: self.render_table())
+        self.decode_checkbox.toggled.connect(self.request_load_records)
         table_header.addWidget(self.decode_checkbox)
         table_layout.addLayout(table_header)
+
         self.records_table = QTableWidget(0, 6)
         self.records_table.setObjectName("RecordsTable")
         self.records_table.setHorizontalHeaderLabels(["uid", "number", "text", "note", "key1", "key2"])
@@ -320,7 +225,7 @@ class MainWindow(QWidget):
         self.records_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.records_table.setAlternatingRowColors(True)
         self.records_table.verticalHeader().setVisible(False)
-        self.records_table.cellClicked.connect(self.toggle_key1_from_row)
+        self.records_table.cellClicked.connect(self.request_toggle_key1)
         self.records_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.records_table.customContextMenuRequested.connect(self.show_records_menu)
         header = self.records_table.horizontalHeader()
@@ -336,104 +241,129 @@ class MainWindow(QWidget):
         layout.addWidget(right_splitter, stretch=1)
         return panel
 
-    def _ensure_key(self) -> None:
-        if is_valid_hex_key(read_key_hex()):
-            return
-        save_key_hex(DEFAULT_KEY)
+    def request_save_key(self) -> None:
+        self.action_requested.emit("save_key", {"key": self.current_key()})
 
-    def _ensure_database(self) -> None:
-        DB_PATH.parent.mkdir(exist_ok=True)
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS records (
-                    uid INTEGER PRIMARY KEY AUTOINCREMENT,
-                    number INTEGER,
-                    text TEXT NOT NULL DEFAULT '',
-                    note TEXT NOT NULL DEFAULT '',
-                    key1 INTEGER NOT NULL DEFAULT 0,
-                    key2 INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-
-    def load_key(self) -> None:
-        key = read_key_hex()
-        self.key_input.setText(key)
-        self.append_debug(f"key loaded from {ENV_PATH} ({len(key) // 2} bytes)", "muted")
-
-    def save_key(self) -> None:
-        key = self.current_key()
-        if not is_valid_hex_key(key):
-            QMessageBox.warning(self, "Invalid key", "XOR key must be non-empty base16 with an even length.")
-            return
-        save_key_hex(key)
-        self.append_debug(f"key saved as {KEY_NAME} hex", "info")
-        self.load_records()
-
-    def toggle_key_visibility(self, visible: bool) -> None:
-        self.key_input.setEchoMode(QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password)
-        self.show_key_button.setText("Hide" if visible else "Show")
-
-    def add_record(self) -> None:
-        number_text = self.number_input.text().strip()
-        try:
-            number = int(number_text) if number_text else 0
-        except ValueError:
-            QMessageBox.warning(self, "Invalid number", "number must be an integer.")
-            return
-        if not is_valid_hex_key(self.current_key()):
-            QMessageBox.warning(self, "Invalid key", "XOR key must be non-empty base16 with an even length.")
-            return
-        text_hex = text_to_xor_hex(self.text_input.text().strip(), self.current_key())
-        note = self.note_input.toPlainText()
-        with sqlite3.connect(DB_PATH) as connection:
-            cursor = connection.execute(
-                "INSERT INTO records (number, text, note, key1, key2) VALUES (?, ?, ?, ?, ?)",
-                (
-                    number,
-                    text_hex,
-                    note,
-                    int(self.key1_checkbox.isChecked()),
-                    int(self.key2_checkbox.isChecked()),
-                ),
-            )
-        self.append_debug(f"record inserted uid={cursor.lastrowid}", "info")
+    def request_add_record(self) -> None:
+        self.action_requested.emit("add_record", self.form_payload())
         self.clear_edit_form()
-        self.load_records()
 
-    def save_edit(self) -> None:
+    def request_save_edit(self) -> None:
         if self._editing_uid is None:
             return
-        number_text = self.number_input.text().strip()
-        try:
-            number = int(number_text) if number_text else 0
-        except ValueError:
-            QMessageBox.warning(self, "Invalid number", "number must be an integer.")
-            return
-        if not is_valid_hex_key(self.current_key()):
-            QMessageBox.warning(self, "Invalid key", "XOR key must be non-empty base16 with an even length.")
-            return
-        text_hex = text_to_xor_hex(self.text_input.text().strip(), self.current_key())
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.execute(
-                """
-                UPDATE records
-                SET number = ?, text = ?, note = ?, key1 = ?, key2 = ?
-                WHERE uid = ?
-                """,
-                (
-                    number,
-                    text_hex,
-                    self.note_input.toPlainText(),
-                    int(self.key1_checkbox.isChecked()),
-                    int(self.key2_checkbox.isChecked()),
-                    self._editing_uid,
-                ),
-            )
-        self.append_debug(f"record updated uid={self._editing_uid}", "info")
+        payload = self.form_payload()
+        payload["uid"] = self._editing_uid
+        self.action_requested.emit("update_record", payload)
         self.clear_edit_form()
-        self.load_records()
+
+    def request_load_records(self) -> None:
+        self.action_requested.emit("load_records", self.view_options())
+
+    def request_toggle_key1(self, row: int, _column: int) -> None:
+        if row < 0 or row >= len(self._rows):
+            return
+        self.action_requested.emit("toggle_key1", {"uid": self._rows[row]["uid"]})
+
+    def form_payload(self) -> dict[str, Any]:
+        return {
+            "number": self.number_input.text(),
+            "text": self.text_input.text(),
+            "note": self.note_input.toPlainText(),
+            "key1": self.key1_checkbox.isChecked(),
+            "key2": self.key2_checkbox.isChecked(),
+        }
+
+    def view_options(self) -> dict[str, Any]:
+        return {
+            "decode": self.decode_checkbox.isChecked(),
+            "key1": self.filter_key1_checkbox.isChecked(),
+            "key2": self.filter_key2_checkbox.isChecked(),
+        }
+
+    def set_key(self, key: str) -> None:
+        self.key_input.setText(key)
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def set_records(self, rows: list) -> None:
+        self._rows = [dict(row) for row in rows]
+        self.records_table.setRowCount(0)
+        true_bg = QColor("#173820")
+        false_bg = QColor("#3a2428")
+        for row_data in self._rows:
+            row = self.records_table.rowCount()
+            self.records_table.insertRow(row)
+            values = [
+                str(row_data.get("uid") or ""),
+                str(row_data.get("number") or ""),
+                str(row_data.get("display_text") or ""),
+                str(row_data.get("note") or ""),
+                "true" if row_data.get("key1") else "false",
+                "true" if row_data.get("key2") else "false",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                if column in (4, 5):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setBackground(true_bg if value == "true" else false_bg)
+                self.records_table.setItem(row, column, item)
+
+    def show_records_menu(self, position) -> None:
+        item = self.records_table.itemAt(position)
+        if item is None:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self._rows):
+            return
+        uid = self._rows[row]["uid"]
+        self.records_table.selectRow(row)
+        menu = QMenu(self)
+        info_action = menu.addAction("Info")
+        edit_action = menu.addAction("Edit")
+        delete_action = menu.addAction("Delete")
+        selected = menu.exec(self.records_table.viewport().mapToGlobal(position))
+        if selected == info_action:
+            self.action_requested.emit("get_record_info", {"uid": uid})
+        elif selected == edit_action:
+            self.action_requested.emit("get_record_for_edit", {"uid": uid})
+        elif selected == delete_action:
+            self.confirm_delete(uid)
+
+    def confirm_delete(self, uid: int) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Delete record",
+            f"Really delete record uid={uid}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.action_requested.emit("delete_record", {"uid": uid})
+            if self._editing_uid == uid:
+                self.clear_edit_form()
+
+    def show_record_info(self, row_data: dict) -> None:
+        message = (
+            f"uid: {row_data.get('uid')}\n"
+            f"number: {row_data.get('number')}\n"
+            f"text decoded:\n{row_data.get('decoded_text') or ''}\n\n"
+            f"note:\n{row_data.get('note') or ''}\n\n"
+            f"key1: {bool(row_data.get('key1'))}\n"
+            f"key2: {bool(row_data.get('key2'))}"
+        )
+        QMessageBox.information(self, f"Record uid={row_data.get('uid')}", message)
+
+    def load_record_for_edit(self, row_data: dict) -> None:
+        self._editing_uid = int(row_data["uid"])
+        self.edit_state_label.setText(f"Editing uid={self._editing_uid}")
+        self.save_edit_button.setEnabled(True)
+        self.number_input.setText(str(row_data.get("number") or ""))
+        self.text_input.setText(str(row_data.get("decoded_text") or ""))
+        self.note_input.setPlainText(str(row_data.get("note") or ""))
+        self.key1_checkbox.setChecked(bool(row_data.get("key1")))
+        self.key2_checkbox.setChecked(bool(row_data.get("key2")))
 
     def clear_edit_form(self) -> None:
         self._editing_uid = None
@@ -452,143 +382,17 @@ class MainWindow(QWidget):
         self.filter_key2_checkbox.setChecked(False)
         self.filter_key1_checkbox.blockSignals(False)
         self.filter_key2_checkbox.blockSignals(False)
-        self.load_records()
+        self.request_load_records()
 
-    def load_records(self) -> None:
-        query = "SELECT uid, number, text, note, key1, key2 FROM records"
-        filters = []
-        params: list[Any] = []
-        if self.filter_key1_checkbox.isChecked():
-            filters.append("key1 = ?")
-            params.append(1)
-        if self.filter_key2_checkbox.isChecked():
-            filters.append("key2 = ?")
-            params.append(1)
-        if filters:
-            query = f"{query} WHERE {' AND '.join(filters)}"
-        query = f"{query} ORDER BY uid DESC"
-
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(query, tuple(params)).fetchall()
-        self._rows = [dict(row) for row in rows]
-        self.render_table()
-        self.status_label.setText(f"{len(self._rows)} rows")
-        active_filters = []
-        if self.filter_key1_checkbox.isChecked():
-            active_filters.append("k1")
-        if self.filter_key2_checkbox.isChecked():
-            active_filters.append("k2")
-        self.append_debug(f"loaded {len(self._rows)} records ({', '.join(active_filters) or 'all'})", "debug")
-
-    def render_table(self) -> None:
-        self.records_table.setRowCount(0)
-        true_bg = QColor("#173820")
-        false_bg = QColor("#3a2428")
-        key = self.current_key()
-        decode_text = self.decode_checkbox.isChecked()
-        for row_data in self._rows:
-            row = self.records_table.rowCount()
-            self.records_table.insertRow(row)
-            raw_text = str(row_data["text"])
-            values = [
-                str(row_data["uid"]),
-                str(row_data["number"]),
-                text_from_xor_hex(raw_text, key) if decode_text else raw_text,
-                str(row_data["note"]),
-                "true" if row_data["key1"] else "false",
-                "true" if row_data["key2"] else "false",
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setToolTip(value)
-                if column in (4, 5):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    item.setBackground(true_bg if value == "true" else false_bg)
-                self.records_table.setItem(row, column, item)
-
-    def show_records_menu(self, position) -> None:
-        item = self.records_table.itemAt(position)
-        if item is None:
-            return
-        row = item.row()
-        if row < 0 or row >= len(self._rows):
-            return
-        self.records_table.selectRow(row)
-        menu = QMenu(self)
-        info_action = menu.addAction("Info")
-        edit_action = menu.addAction("Edit")
-        delete_action = menu.addAction("Delete")
-        selected = menu.exec(self.records_table.viewport().mapToGlobal(position))
-        if selected == info_action:
-            self.show_record_info(row)
-            return
-        if selected == edit_action:
-            self.edit_record(row)
-            return
-        if selected == delete_action:
-            self.delete_record(row)
-
-    def decoded_row(self, row: int) -> dict[str, Any]:
-        row_data = dict(self._rows[row])
-        row_data["decoded_text"] = text_from_xor_hex(str(row_data["text"]), self.current_key())
-        return row_data
-
-    def show_record_info(self, row: int) -> None:
-        row_data = self.decoded_row(row)
-        message = (
-            f"uid: {row_data['uid']}\n"
-            f"number: {row_data['number']}\n"
-            f"text decoded:\n{row_data['decoded_text']}\n\n"
-            f"note:\n{row_data['note']}\n\n"
-            f"key1: {bool(row_data['key1'])}\n"
-            f"key2: {bool(row_data['key2'])}"
-        )
-        QMessageBox.information(self, f"Record uid={row_data['uid']}", message)
-
-    def edit_record(self, row: int) -> None:
-        row_data = self.decoded_row(row)
-        self._editing_uid = int(row_data["uid"])
-        self.edit_state_label.setText(f"Editing uid={self._editing_uid}")
-        self.save_edit_button.setEnabled(True)
-        self.number_input.setText(str(row_data["number"]))
-        self.text_input.setText(str(row_data["decoded_text"]))
-        self.note_input.setPlainText(str(row_data["note"]))
-        self.key1_checkbox.setChecked(bool(row_data["key1"]))
-        self.key2_checkbox.setChecked(bool(row_data["key2"]))
-        self.append_debug(f"record loaded for edit uid={self._editing_uid}", "muted")
-
-    def delete_record(self, row: int) -> None:
-        row_data = self._rows[row]
-        uid = int(row_data["uid"])
-        answer = QMessageBox.question(
-            self,
-            "Delete record",
-            f"Really delete record uid={uid}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.execute("DELETE FROM records WHERE uid = ?", (uid,))
-        if self._editing_uid == uid:
-            self.clear_edit_form()
-        self.append_debug(f"record deleted uid={uid}", "warn")
-        self.load_records()
-
-    def toggle_key1_from_row(self, row: int, _column: int) -> None:
-        if row < 0 or row >= len(self._rows):
-            return
-        uid = int(self._rows[row]["uid"])
-        new_value = 0 if int(self._rows[row]["key1"]) else 1
-        with sqlite3.connect(DB_PATH) as connection:
-            connection.execute("UPDATE records SET key1 = ? WHERE uid = ?", (new_value, uid))
-        self.append_debug(f"uid={uid} key1 -> {bool(new_value)}", "info")
-        self.load_records()
+    def toggle_key_visibility(self, visible: bool) -> None:
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password)
+        self.show_key_button.setText("Hide" if visible else "Show")
 
     def current_key(self) -> str:
         return self.key_input.text().strip().lower()
+
+    def show_error(self, title: str, text: str) -> None:
+        QMessageBox.warning(self, title, text)
 
     def append_debug(self, text: str, level: str = "info") -> None:
         colors = {
